@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import init_db, get_db
-from app.routes import auth, instagram, posts, chat
+from app.routes import auth, instagram, posts, chat, comments
 from app.routes.instagram import instagram_callback
 
 
@@ -30,6 +30,7 @@ app.include_router(auth.router)
 app.include_router(instagram.router)
 app.include_router(posts.router)
 app.include_router(chat.router)
+app.include_router(comments.router)
 
 
 @app.get("/health")

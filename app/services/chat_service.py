@@ -1,14 +1,15 @@
+import asyncio
 import re
 import uuid
 from openai import AsyncOpenAI
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
+from sqlalchemy.orm import defer
 
 from app.config import settings
 from app.models.models import Comment
 from app.services.embedding_service import embed_text
 
-# Structural filter keywords — these queries need all comments, not vector search
 _STRUCTURAL_KEYWORDS = {
     "emoji", "emojis", "hashtag", "hashtags", "link", "url",
     "mention", "question", "exclamation", "uppercase", "capital",
@@ -25,32 +26,12 @@ _EMOJI_RE = re.compile(
 )
 
 
-_LISTING_SIGNALS = {"list", "show", "get", "fetch", "find", "filter", "display", "give", "which", "all"}
-
-_ANALYSIS_SIGNALS = {
-    "what do", "how do", "summarize", "summary", "analyze", "analysis",
-    "sentiment", "opinion", "theme", "pattern", "breakdown", "overall", "think",
-    "feel", "insight", "understand", "explain",
-}
-
-
-def _classify_intent(question: str) -> str:
-    """Return 'listing' or 'analysis'."""
-    q = question.lower()
-    if set(q.split()) & _LISTING_SIGNALS:
-        return "listing"
-    if any(p in q for p in _ANALYSIS_SIGNALS):
-        return "analysis"
-    return "listing"  # default: assume retrieval
-
-
 def _is_structural_query(question: str) -> bool:
     q = question.lower()
     return any(kw in q for kw in _STRUCTURAL_KEYWORDS)
 
 
 def _prefilter_comments(question: str, comments: list[Comment]) -> list[Comment]:
-    """Client-side filter for properties vector search can't find."""
     q = question.lower()
     if "emoji" in q or "emojis" in q:
         return [c for c in comments if _EMOJI_RE.search(c.text)]
@@ -65,38 +46,37 @@ def _prefilter_comments(question: str, comments: list[Comment]) -> list[Comment]
     return comments
 
 
-
 _client = AsyncOpenAI(
     base_url=settings.azure_openai_endpoint,
     api_key=settings.azure_openai_api_key,
 )
 
-
-_SYSTEM_PROMPT = """You are Echoo, an AI that helps creators understand their Instagram comments.
-
+_LISTING_PROMPT = """You are filtering Instagram comments.
 Each comment is prefixed with [N] — its index number.
 
-Decide the response type based on the question:
+Output ONLY one line — the indices of comments that match the request:
+USED:[comma-separated indices, e.g. USED:0,3,7]
 
-LISTING (show, find, get, list, which comments, filter):
-- Return ONLY a markdown list of matching comments: `- @username: comment text`
-- No intro sentence, no summary, no extra words.
+If none match, output: USED:
+Nothing else. No explanation. No list. Just the USED line."""
 
-ANALYSIS (what do people think, sentiment, themes, opinions, summary, breakdown):
-- Write 2-3 focused paragraphs.
-- DO NOT list individual comments. Describe patterns and quote short phrases inline as evidence.
+_ANALYSIS_PROMPT = """You are Echoo, an AI that helps creators understand their Instagram comments.
+Each comment is prefixed with [N] — its index number.
+
+The user wants ANALYSIS or SUMMARY. Write 2-3 focused paragraphs.
+DO NOT list individual comments. Describe patterns and quote short phrases inline as evidence.
 
 After your response, on a NEW LINE output exactly:
-USED:[comma-separated indices of every comment you referenced, e.g. USED:0,3,7]
+USED:[comma-separated indices of comments you referenced, e.g. USED:0,3,7]
 
-Rules: Be direct. Only use comments provided. Never invent comments or usernames."""
+Be direct. Only use comments provided. Never invent comments or usernames."""
 
 
 async def _search_comments(
     query_embedding: list[float],
     post_ids: list[uuid.UUID],
     db: AsyncSession,
-    limit: int = 20,
+    limit: int = 30,
 ) -> list[Comment]:
     result = await db.execute(
         select(Comment)
@@ -109,70 +89,101 @@ async def _search_comments(
 
 
 async def _fetch_all_comments(post_ids: list[uuid.UUID], db: AsyncSession) -> list[Comment]:
+    # Defer embedding column — 1536 floats per row, not needed for listing
     result = await db.execute(
-        select(Comment).where(Comment.post_id.in_(post_ids))
+        select(Comment)
+        .where(Comment.post_id.in_(post_ids))
+        .options(defer(Comment.embedding))
     )
     return list(result.scalars().all())
+
+
+def _parse_used(raw: str) -> tuple[str, set[int]]:
+    """Split LLM output into (answer, used_indices)."""
+    used_indices: set[int] = set()
+    answer = raw
+    if "USED:" in raw:
+        answer_part, used_part = raw.rsplit("USED:", 1)
+        answer = answer_part.strip()
+        used_part = used_part.strip().split("\n")[0]  # only first line after USED:
+        try:
+            used_indices = {int(x.strip()) for x in used_part.split(",") if x.strip().isdigit()}
+        except ValueError:
+            pass
+    return answer, used_indices
 
 
 async def answer_question(
     question: str,
     post_ids: list[uuid.UUID],
     db: AsyncSession,
+    mode: str = "listing",
+    history: list[dict] | None = None,
 ) -> tuple[str, list[Comment]]:
-    intent = _classify_intent(question)
 
-    # ── Path 1: structural listing (emoji, hashtag, etc.) ──────────────────────
-    # Zero LLM cost — Python filters all comments directly.
-    if _is_structural_query(question) and intent == "listing":
-        all_comments = await _fetch_all_comments(post_ids, db)
-        comments = _prefilter_comments(question, all_comments)
-        if not comments:
-            return "No comments matched that filter.", []
-        answer = "\n".join(f"- @{c.username}: {c.text}" for c in comments[:200])
-        return answer, comments[:200]
+    # ── LISTING mode ───────────────────────────────────────────────────────────
+    if mode == "listing":
 
-    # ── Path 2 & 3: LLM pipeline ──────────────────────────────────────────────────
-    if _is_structural_query(question):
-        all_comments = await _fetch_all_comments(post_ids, db)
-        comments = _prefilter_comments(question, all_comments)[:100]
-    elif intent == "listing":
-        # Listing needs full coverage — fetch all, cap at 300 so LLM context stays safe.
-        # Vector search pre-filtering would silently miss valid matches.
+        # Structural filters — pure Python, zero LLM cost, zero answer text
+        if _is_structural_query(question):
+            all_comments = await _fetch_all_comments(post_ids, db)
+            comments = _prefilter_comments(question, all_comments)
+            return "", comments[:200]
+
+        # Semantic listing — fetch all, LLM classifies (outputs only USED: line)
         comments = await _fetch_all_comments(post_ids, db)
-        comments = comments[:300]
-    else:
-        # Analysis only needs a representative sample — vector search is fine.
-        query_embedding = await embed_text(question)
-        comments = await _search_comments(query_embedding, post_ids, db, limit=20)
+        comments = comments[:2000]
+        if not comments:
+            return "", []
 
+        context = "\n".join(f"[{i}] @{c.username}: {c.text[:200]}" for i, c in enumerate(comments))
+        response = await _client.chat.completions.create(
+            model=settings.azure_chat_deployment,
+            messages=[
+                {"role": "system", "content": _LISTING_PROMPT},
+                {"role": "user", "content": f"Comments:\n{context}\n\nFilter request: {question}"},
+            ],
+            max_tokens=5000,  # worst case: 2000 indices × ~2 tokens each
+            temperature=0.0,
+        )
+        raw = response.choices[0].message.content.strip()
+        _, used_indices = _parse_used(raw)
+        matched = [comments[i] for i in sorted(used_indices) if i < len(comments)]
+        return "", matched
+
+    # ── ANALYSIS mode ──────────────────────────────────────────────────────────
+    # Parallelize: embed question + fetch random sample simultaneously
+    query_embedding, rand_result = await asyncio.gather(
+        embed_text(question),
+        db.execute(
+            select(Comment)
+            .where(Comment.post_id.in_(post_ids))
+            .order_by(func.random())
+            .limit(20)
+        ),
+    )
+    random_sample = list(rand_result.scalars().all())
+    relevant = await _search_comments(query_embedding, post_ids, db, limit=30)
+
+    seen = {c.id for c in relevant}
+    comments = relevant + [c for c in random_sample if c.id not in seen]
     if not comments:
-        return "No synced comments found for the selected posts. Please sync comments first.", []
+        return "No synced comments found. Please sync comments first.", []
 
     context = "\n".join(f"[{i}] @{c.username}: {c.text[:200]}" for i, c in enumerate(comments))
+    messages = [{"role": "system", "content": _ANALYSIS_PROMPT}]
+    if history:
+        messages.extend(history[-6:])
+    messages.append({"role": "user", "content": f"Comments:\n{context}\n\nQuestion: {question}"})
 
     response = await _client.chat.completions.create(
         model=settings.azure_chat_deployment,
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
-            {"role": "user", "content": f"Comments:\n{context}\n\nQuestion: {question}"},
-        ],
-        max_tokens=2000,
+        messages=messages,
+        max_tokens=800,
         temperature=0.3,
     )
-
     raw = response.choices[0].message.content.strip()
-
-    used_indices: set[int] = set()
-    answer = raw
-    if "\nUSED:" in raw:
-        answer_part, used_part = raw.rsplit("\nUSED:", 1)
-        answer = answer_part.strip()
-        try:
-            used_indices = {int(x.strip()) for x in used_part.split(",") if x.strip().isdigit()}
-        except ValueError:
-            pass
-
+    answer, used_indices = _parse_used(raw)
     source_comments = [comments[i] for i in sorted(used_indices) if i < len(comments)]
     if not source_comments:
         source_comments = comments

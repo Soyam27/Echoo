@@ -52,6 +52,7 @@ class SyncRequest(BaseModel):
 
 class CommentResponse(BaseModel):
     id: UUID
+    instagram_comment_id: str
     username: str
     text: str
     posted_at: datetime
@@ -63,7 +64,8 @@ class CommentResponse(BaseModel):
 
 class ChatRequest(BaseModel):
     question: str
-    post_ids: List[UUID]           # internal DB post UUIDs to search over
+    post_ids: List[UUID]
+    mode: str = "listing"          # "listing" or "analysis"
     conversation_id: Optional[UUID] = None
 
 class ChatResponse(BaseModel):

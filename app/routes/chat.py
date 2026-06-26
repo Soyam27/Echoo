@@ -48,8 +48,24 @@ async def chat(
         content=request.question,
     ))
 
-    answer, source_comments = await answer_question(request.question, request.post_ids, db)
+    # Build history for analysis mode (last 3 turns)
+    history = None
+    if request.mode == "analysis" and request.conversation_id:
+        result = await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conversation.id)
+            .order_by(Message.created_at.desc())
+            .limit(6)
+        )
+        past = list(reversed(result.scalars().all()))
+        history = [{"role": m.role, "content": m.content} for m in past]
 
+    answer, source_comments = await answer_question(
+        request.question, request.post_ids, db,
+        mode=request.mode,
+        history=history,
+    )
+    print(answer)
     db.add(Message(
         id=uuid.uuid4(),
         conversation_id=conversation.id,
@@ -63,7 +79,7 @@ async def chat(
         answer=answer,
         conversation_id=conversation.id,
         sources=[
-            CommentResponse(id=c.id, username=c.username, text=c.text, posted_at=c.posted_at)
+            CommentResponse(id=c.id, instagram_comment_id=c.instagram_comment_id, username=c.username, text=c.text, posted_at=c.posted_at)
             for c in source_comments
         ],
     )
