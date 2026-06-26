@@ -1,0 +1,111 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# SQLite databases
+*.sqlite3
+*.db
+
+# Coverage reports
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.cache/
+
+# Type checker
+.mypy_cache/
+.pyre/
+.pytype/
+
+# Linter
+.ruff_cache/
+
+# Testing
+.tox/
+.nox/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# FastAPI/Uvicorn
+*.pid
+
+# Static and media (optional)
+staticfiles/
+media/
+
+# Alembic
+alembic/versions/*.pyc
+
+# Secrets
+secrets.json
+credentials.json
+
+# Python version
+.python-version
+
+# Poetry
+poetry.lock
+
+# Pipenv
+Pipfile.lock
+
+# Hatch
+.hatch/
+
+# PyCharm
+.idea/
+
+# VS Code
+.history/
+
+# Generated files
+*.tmp
+*.bak
