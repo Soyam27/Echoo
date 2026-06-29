@@ -85,10 +85,11 @@ async def fetch_user_posts(access_token: str, ig_user_id: str) -> list[dict]:
 
 
 async def fetch_post_comments(post_id: str, access_token: str) -> list[dict]:
-    comments = []
+    all_comments = []
     url = f"{_GRAPH_URL}/{post_id}/comments"
     params = {
-        "fields": "id,text,username,timestamp",
+        # replies{id} lets us collect all reply IDs so we can exclude them
+        "fields": "id,text,username,timestamp,replies{id}",
         "access_token": access_token,
         "limit": 100,
     }
@@ -96,12 +97,17 @@ async def fetch_post_comments(post_id: str, access_token: str) -> list[dict]:
     async with httpx.AsyncClient() as client:
         while url:
             r = await client.get(url, params=params)
-            print(f"[comments] status={r.status_code} body={r.text[:500]}")
             if r.status_code != 200:
                 break
             data = r.json()
-            comments.extend(data.get("data", []))
+            all_comments.extend(data.get("data", []))
             url = data.get("paging", {}).get("next")
             params = {}
 
-    return comments
+    # Build set of all reply IDs — any comment whose ID appears here is a reply
+    reply_ids: set[str] = set()
+    for c in all_comments:
+        for reply in c.get("replies", {}).get("data", []):
+            reply_ids.add(reply["id"])
+
+    return [c for c in all_comments if c["id"] not in reply_ids]

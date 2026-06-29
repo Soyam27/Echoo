@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     instagram_client_secret: str
     instagram_redirect_uri: str
 
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = "http://localhost:8000/youtube/callback"
+
     frontend_url: str = "http://localhost:3000"
 
     class Config:

@@ -34,3 +34,9 @@ async def init_db():
             "CREATE INDEX IF NOT EXISTS idx_comments_embedding "
             "ON comments USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
         ))
+        await conn.execute(text(
+            "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS post_ids JSON DEFAULT '[]'::json"
+        ))
+        await conn.execute(text(
+            "ALTER TABLE posts ADD COLUMN IF NOT EXISTS is_external BOOLEAN NOT NULL DEFAULT FALSE"
+        ))

@@ -51,7 +51,7 @@ _client = AsyncOpenAI(
     api_key=settings.azure_openai_api_key,
 )
 
-_LISTING_PROMPT = """You are filtering Instagram comments.
+_LISTING_PROMPT = """You are filtering social media comments (Instagram or YouTube).
 Each comment is prefixed with [N] — its index number.
 
 Output ONLY one line — the indices of comments that match the request:
@@ -60,7 +60,7 @@ USED:[comma-separated indices, e.g. USED:0,3,7]
 If none match, output: USED:
 Nothing else. No explanation. No list. Just the USED line."""
 
-_ANALYSIS_PROMPT = """You are Echoo, an AI that helps creators understand their Instagram comments.
+_ANALYSIS_PROMPT = """You are Echoo, an AI that helps creators understand their audience comments (from Instagram or YouTube).
 Each comment is prefixed with [N] — its index number.
 
 The user wants ANALYSIS or SUMMARY. Write 2-3 focused paragraphs.
@@ -72,11 +72,25 @@ USED:[comma-separated indices of comments you referenced, e.g. USED:0,3,7]
 Be direct. Only use comments provided. Never invent comments or usernames."""
 
 
+def _compute_limits(total: int) -> tuple[int, int]:
+    """Return (semantic_limit, random_limit) keeping context small for speed."""
+    semantic = min(max(25, total // 4), 80)
+    random = min(max(5, total // 20), 15)
+    return semantic, random
+
+
+async def _count_comments(post_ids: list[uuid.UUID], db: AsyncSession) -> int:
+    result = await db.execute(
+        select(func.count()).where(Comment.post_id.in_(post_ids))
+    )
+    return result.scalar() or 0
+
+
 async def _search_comments(
     query_embedding: list[float],
     post_ids: list[uuid.UUID],
     db: AsyncSession,
-    limit: int = 30,
+    limit: int,
 ) -> list[Comment]:
     result = await db.execute(
         select(Comment)
@@ -152,34 +166,14 @@ async def answer_question(
         return "", matched
 
     # ── ANALYSIS mode ──────────────────────────────────────────────────────────
-    # Parallelize: embed question + fetch random sample simultaneously
-    query_embedding, rand_result = await asyncio.gather(
-        embed_text(question),
-        db.execute(
-            select(Comment)
-            .where(Comment.post_id.in_(post_ids))
-            .order_by(func.random())
-            .limit(20)
-        ),
-    )
-    random_sample = list(rand_result.scalars().all())
-    relevant = await _search_comments(query_embedding, post_ids, db, limit=30)
-
-    seen = {c.id for c in relevant}
-    comments = relevant + [c for c in random_sample if c.id not in seen]
+    llm_messages, comments = await build_analysis_context(question, post_ids, db, history)
     if not comments:
         return "No synced comments found. Please sync comments first.", []
 
-    context = "\n".join(f"[{i}] @{c.username}: {c.text[:200]}" for i, c in enumerate(comments))
-    messages = [{"role": "system", "content": _ANALYSIS_PROMPT}]
-    if history:
-        messages.extend(history[-6:])
-    messages.append({"role": "user", "content": f"Comments:\n{context}\n\nQuestion: {question}"})
-
     response = await _client.chat.completions.create(
         model=settings.azure_chat_deployment,
-        messages=messages,
-        max_tokens=800,
+        messages=llm_messages,
+        max_tokens=400,
         temperature=0.3,
     )
     raw = response.choices[0].message.content.strip()
@@ -189,3 +183,38 @@ async def answer_question(
         source_comments = comments
 
     return answer, source_comments
+
+
+async def build_analysis_context(
+    question: str,
+    post_ids: list[uuid.UUID],
+    db: AsyncSession,
+    history: list[dict] | None = None,
+) -> tuple[list[dict], list[Comment]]:
+    """Retrieve comments and build LLM messages. Shared by sync and streaming paths."""
+    total, query_embedding = await asyncio.gather(
+        _count_comments(post_ids, db),
+        embed_text(question),
+    )
+    semantic_limit, random_limit = _compute_limits(total)
+
+    relevant, rand_result = await asyncio.gather(
+        _search_comments(query_embedding, post_ids, db, limit=semantic_limit),
+        db.execute(
+            select(Comment)
+            .where(Comment.post_id.in_(post_ids))
+            .order_by(func.random())
+            .limit(random_limit)
+        ),
+    )
+    random_sample = list(rand_result.scalars().all())
+    seen = {c.id for c in relevant}
+    comments = relevant + [c for c in random_sample if c.id not in seen]
+
+    context = "\n".join(f"[{i}] @{c.username}: {c.text[:150]}" for i, c in enumerate(comments))
+    messages = [{"role": "system", "content": _ANALYSIS_PROMPT}]
+    if history:
+        messages.extend(history[-4:])
+    messages.append({"role": "user", "content": f"Comments:\n{context}\n\nQuestion: {question}"})
+
+    return messages, comments
