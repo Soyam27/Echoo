@@ -436,3 +436,61 @@ async def _upsert_comments(
 
 async def _sync_comments_task(post_ids: list[uuid.UUID]) -> None:
     await asyncio.gather(*[_sync_one_post(pid) for pid in post_ids])
+
+
+async def _sync_ig_external_task(post_id: uuid.UUID) -> None:
+    """Scrape comments from a public Instagram post and embed them."""
+    async with _SYNC_SEMAPHORE:
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(select(Post).where(Post.id == post_id))
+            post = result.scalar_one_or_none()
+            if not post:
+                return
+
+            post.sync_status = SyncStatus.syncing
+            await db.commit()
+
+            try:
+                from app.services.ig_scraper_service import fetch_comments
+                from app.config import settings
+
+                scraped = await fetch_comments(post.permalink, settings.ig_cookies)
+
+                raw_comments = []
+                for c in scraped:
+                    if not c.get("text"):
+                        continue
+                    ts = c.get("timestamp")
+                    if isinstance(ts, (int, float)):
+                        from datetime import timezone
+                        ts_str = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                    else:
+                        ts_str = str(ts) if ts else ""
+                    raw_comments.append({
+                        "id": c["id"] or "",
+                        "username": c.get("username", "unknown"),
+                        "text": c["text"],
+                        "timestamp": ts_str,
+                    })
+
+                await _upsert_comments(
+                    post, db, raw_comments,
+                    platform="instagram",
+                    id_key="id",
+                    text_key="text",
+                    user_key="username",
+                    time_key="timestamp",
+                    comment_id_field="instagram_comment_id",
+                )
+            except Exception as e:
+                print(f"[ig_scrape] post={post_id} error: {e}")
+                traceback.print_exc()
+                try:
+                    await db.rollback()
+                    r2 = await db.execute(select(Post).where(Post.id == post_id))
+                    failed = r2.scalar_one_or_none()
+                    if failed:
+                        failed.sync_status = SyncStatus.failed
+                        await db.commit()
+                except Exception as inner:
+                    print(f"[ig_scrape] could not mark failed: {inner}")

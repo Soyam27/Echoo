@@ -25,6 +25,9 @@ class Settings(BaseSettings):
 
     frontend_url: str = "http://localhost:3000"
 
+    # Instagram scraper cookies (copy the full "cookie:" header from DevTools)
+    ig_cookies: str = ""
+
     class Config:
         env_file = ".env"
 

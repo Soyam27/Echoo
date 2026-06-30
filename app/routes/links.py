@@ -12,7 +12,7 @@ from pydantic import BaseModel
 from app.database import get_db
 from app.models.models import Post, SyncStatus, User, ConnectedAccount
 from app.core.deps import get_current_user
-from app.routes.posts import _sync_comments_task
+from app.routes.posts import _sync_comments_task, _sync_ig_external_task
 
 router = APIRouter(prefix="/links", tags=["links"])
 
@@ -38,7 +38,7 @@ def _extract_youtube_video_id(url: str) -> str | None:
 def _extract_instagram_shortcode(url: str) -> str | None:
     patterns = [
         r'instagram\.com/p/([A-Za-z0-9_-]+)',
-        r'instagram\.com/reel/([A-Za-z0-9_-]+)',
+        r'instagram\.com/reels?/([A-Za-z0-9_-]+)',
         r'instagram\.com/tv/([A-Za-z0-9_-]+)',
     ]
     for pattern in patterns:
@@ -60,19 +60,7 @@ async def analyze_link(
     # ── Instagram ──────────────────────────────────────────────────────────────
     shortcode = _extract_instagram_shortcode(url)
     if shortcode:
-        ig_result = await db.execute(
-            select(ConnectedAccount).where(
-                ConnectedAccount.user_id == current_user.id,
-                ConnectedAccount.platform == "instagram",
-            ).limit(1)
-        )
-        ig_account = ig_result.scalar_one_or_none()
-        if not ig_account:
-            raise HTTPException(
-                status_code=400,
-                detail="Connect an Instagram account first to analyze Instagram links",
-            )
-
+        # Check if we already have this post for this user (by permalink)
         post_result = await db.execute(
             select(Post).where(
                 Post.user_id == current_user.id,
@@ -81,21 +69,46 @@ async def analyze_link(
             )
         )
         post = post_result.scalar_one_or_none()
-        if not post:
-            raise HTTPException(
-                status_code=400,
-                detail="This Instagram post was not found in your connected account. Only your own posts are supported.",
-            )
 
-        if post.sync_status in (SyncStatus.pending, SyncStatus.failed):
-            post.sync_status = SyncStatus.pending
-            await db.commit()
-            background_tasks.add_task(_sync_comments_task, [post.id])
+        if post:
+            if post.sync_status in (SyncStatus.pending, SyncStatus.failed):
+                post.sync_status = SyncStatus.pending
+                await db.commit()
+                if post.is_external:
+                    background_tasks.add_task(_sync_ig_external_task, post.id)
+                else:
+                    background_tasks.add_task(_sync_comments_task, [post.id])
+            return {
+                "post_id": str(post.id),
+                "sync_status": post.sync_status.value,
+                "already_existed": True,
+            }
+
+        # Create a new external post record and scrape it
+        post = Post(
+            id=uuid.uuid4(),
+            user_id=current_user.id,
+            connected_account_id=None,
+            platform="instagram",
+            instagram_post_id=None,
+            caption=f"Instagram post ({shortcode})",
+            media_url=None,
+            media_type="IMAGE",
+            permalink=f"https://www.instagram.com/p/{shortcode}/",
+            posted_at=datetime.utcnow(),
+            sync_status=SyncStatus.pending,
+            comment_count=0,
+            is_external=True,
+        )
+        db.add(post)
+        await db.commit()
+
+        background_tasks.add_task(_sync_ig_external_task, post.id)
 
         return {
             "post_id": str(post.id),
-            "sync_status": post.sync_status.value,
-            "already_existed": True,
+            "sync_status": "pending",
+            "already_existed": False,
         }
 
     # ── YouTube ────────────────────────────────────────────────────────────────

@@ -71,11 +71,31 @@ async def chat(
         history=history,
     )
     print(answer)
+
+    if request.mode == "listing":
+        assistant_content = json.dumps({
+            "_listing": True,
+            "count": len(source_comments),
+            "sources": [
+                {
+                    "id": str(c.id),
+                    "platform": c.platform,
+                    "external_comment_id": c.instagram_comment_id or c.youtube_comment_id or "",
+                    "username": c.username,
+                    "text": c.text,
+                    "posted_at": c.posted_at.isoformat(),
+                }
+                for c in source_comments[:100]
+            ],
+        })
+    else:
+        assistant_content = answer
+
     db.add(Message(
         id=uuid.uuid4(),
         conversation_id=conversation.id,
         role="assistant",
-        content=answer,
+        content=assistant_content,
     ))
 
     await db.commit()
